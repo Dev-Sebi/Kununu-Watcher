@@ -133,7 +133,7 @@ async function sendDiscordNotification(rating) {
       embeds: [
         {
           title: `New Kununu Rating for ${CONFIG.name}`,
-          url: rating.url,
+          url: CONFIG.url,
           color: CONFIG.color,
           fields: [
             {
