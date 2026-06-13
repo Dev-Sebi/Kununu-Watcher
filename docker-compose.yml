@@ -1,0 +1,11 @@
+services:
+  kununu-watcher:
+    build: .
+    container_name: kununu-watcher
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Force the db into the mounted volume regardless of .env
+      DB_PATH: /app/data/db.json
+    volumes:
+      - ./data:/app/data

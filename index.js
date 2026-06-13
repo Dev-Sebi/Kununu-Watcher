@@ -1,154 +1,212 @@
+import "dotenv/config";
 import axios from "axios";
-import * as cheerio from "cheerio";
+import { chromium } from "playwright";
 import fs from "fs/promises";
-import crypto from "crypto";
+import path from "path";
 import dayjs from "dayjs";
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const CONFIG = {
-  name: "Test GmbH",
-  url: "https://www.kununu.com/de/test/kommentare",
-  baseUrl: "https://www.kununu.com",
+// ── Required env guard ──────────────────────────────────────────────────────────
+for (const name of ["KUNUNU_URL", "DISCORD_WEBHOOK"]) {
+  if (!process.env[name]) {
+    console.error(`❌ Missing required env var: ${name}`);
+    process.exit(1);
+  }
+}
 
-  webhook:
-    "https://discord.com/api/webhooks/1477653872775401728/YOUR_WEBHHOOK_URL",
-  userId: "", // Discord user ID to ping — leave empty to disable
-  color: 0x00b4d8,
+const BASE_URL = process.env.KUNUNU_BASE_URL || "https://www.kununu.com";
 
-  db: "./db.json",
-  interval: 5 * 60 * 1000, // how often to check (ms)
-  retry: 60 * 1000, // how long to wait after an error (ms)
-  timeout: 15_000, // HTTP request timeout (ms)
-
-  headers: {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Cache-Control": "no-cache",
-  },
-
-  // CSS selectors — update these if Kununu changes its layout
-  selectors: {
-    card: "article[data-testid^='review-']",
-    title: "h3",
-    score: "span[class*='score']",
-    date: "time[datetime]",
-    link: "a[href]",
-  },
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 };
 
-// ── Database ──────────────────────────────────────────────────────────────────
+// Only used to confirm the AWS WAF challenge has cleared and to read the
+// profile UUID out of a rendered review permalink. All review data itself
+// comes from the JSON middleware, not the HTML.
+const REVIEW_CARD = "article[data-testid^='review-']";
+const STATEMENTS_LINK = "a[href*='/statements/']";
 
-// Create db.json if it doesn't exist yet
-async function initDB() {
-  try {
-    await fs.access(CONFIG.db);
-  } catch {
-    console.log(`📁 No database found — creating ${CONFIG.db}`);
-    await saveDB({ lastRatingId: null });
-  }
+// ── Database (lowdb-style JSON file) ────────────────────────────────────────────
+//
+// Shape: { seeded: boolean, reviews: { [uuid]: { updatedAt, createdAt, title, score, url } } }
+//   - seeded  : true once the first run has recorded every existing review silently
+//   - reviews : every review ever seen, keyed by its Kununu uuid. updatedAt is the
+//               server's own edit timestamp, so a changed updatedAt = the review
+//               was edited; an unknown uuid = a brand-new review.
+
+const DEFAULT_DB = { seeded: false, reviews: {} };
+
+function dbPath() {
+  return process.env.DB_PATH || "./data/db.json";
 }
 
-// Load the database
 async function loadDB() {
   try {
-    const data = await fs.readFile(CONFIG.db, "utf-8");
-    return JSON.parse(data);
+    const parsed = JSON.parse(await fs.readFile(dbPath(), "utf-8"));
+    return { ...DEFAULT_DB, ...parsed, reviews: parsed.reviews || {} };
   } catch (error) {
+    if (error.code === "ENOENT") {
+      console.log(`📁 No database found — creating ${dbPath()}`);
+      return { ...DEFAULT_DB };
+    }
     console.error("Error loading database:", error.message);
-    return { lastRatingId: null };
+    return { ...DEFAULT_DB };
   }
 }
 
-// Save the database
 async function saveDB(data) {
   try {
-    await fs.writeFile(CONFIG.db, JSON.stringify(data, null, 2));
+    await fs.mkdir(path.dirname(dbPath()), { recursive: true });
+    await fs.writeFile(dbPath(), JSON.stringify(data, null, 2));
   } catch (error) {
     console.error("Error saving database:", error.message);
   }
 }
 
-// ── Scraping ──────────────────────────────────────────────────────────────────
+// What we persist per review
+const snapshot = (r) => ({
+  updatedAt: r.updatedAt,
+  createdAt: r.createdAt,
+  title: r.title,
+  score: r.score,
+  url: r.url,
+});
 
-// Build a stable ID for a rating — prefer the permalink, fall back to a hash
-function buildId(href, title, date) {
-  if (href) return href;
-  return crypto
-    .createHash("sha1")
-    .update(`${title}|${date}`.toLowerCase())
-    .digest("hex")
-    .slice(0, 16);
+// ── Kununu access ───────────────────────────────────────────────────────────────
+
+// Pull country + company slug out of the configured reviews URL,
+// e.g. https://www.kununu.com/de/stortrec/kommentare -> { country: "de", slug: "stortrec" }
+function parseTarget(url) {
+  const seg = new URL(url).pathname.split("/").filter(Boolean);
+  return { country: seg[0] || "de", slug: seg[1] || "" };
 }
 
-// Fetch the ratings page and return the newest review
-async function scrapeLatestRating() {
-  const { data: html } = await axios.get(CONFIG.url, {
-    headers: CONFIG.headers,
-    timeout: CONFIG.timeout,
-    maxRedirects: 5,
+// JSON middleware that backs the "load more reviews" button — page 1..pagesCount
+function reviewsApiUrl(country, slug, uuid, page) {
+  return `${BASE_URL}/middlewares/profiles/${country}/${slug}/${uuid}/reviews?fetchFactorScores=0&reviewType=employees&urlParams=&page=${page}`;
+}
+
+// Normalize a raw API review object
+function mapReview(raw, country, profileUuid) {
+  return {
+    id: raw.uuid,
+    title: raw.title || "Untitled",
+    score: typeof raw.score === "number" ? raw.score.toFixed(1) : "N/A",
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt || raw.createdAt,
+    url: `${BASE_URL}/${country}/statements/${profileUuid}/review/${raw.uuid}`,
+  };
+}
+
+// Open a browser, clear the WAF challenge, and return a JSON page fetcher that
+// reuses the WAF cookies. Caller must close the returned browser.
+async function openSession() {
+  const { country, slug } = parseTarget(process.env.KUNUNU_URL);
+  const pageTimeout = Number.parseInt(process.env.PAGE_TIMEOUT_MS || "45000");
+
+  const browser = await chromium.launch({
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
+  const context = await browser.newContext({
+    userAgent: HEADERS["User-Agent"],
+    locale: "de-DE",
+    extraHTTPHeaders: { "Accept-Language": HEADERS["Accept-Language"] },
+  });
+  const page = await context.newPage();
 
-  const $ = cheerio.load(html);
-  const sel = CONFIG.selectors;
-  const card = $(sel.card).first();
+  await page.goto(process.env.KUNUNU_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: pageTimeout,
+  });
+  // Review cards rendering = WAF challenge cleared + cookies set.
+  await page.waitForSelector(REVIEW_CARD, { timeout: pageTimeout });
 
-  if (!card.length) {
-    console.warn("⚠️  No review card found — selectors may need updating");
-    return null;
+  const href = await page
+    .$eval(STATEMENTS_LINK, (el) => el.getAttribute("href"))
+    .catch(() => null);
+  const match = href && href.match(/\/statements\/([0-9a-f-]{36})\//i);
+  if (!match) throw new Error("Could not determine profile UUID from the page");
+  const profileUuid = match[1];
+
+  async function fetchPage(n) {
+    const res = await context.request.get(
+      reviewsApiUrl(country, slug, profileUuid, n),
+      { headers: { accept: "application/json" } },
+    );
+    if (res.status() !== 200) {
+      throw new Error(`reviews API page ${n} returned HTTP ${res.status()}`);
+    }
+    const json = await res.json();
+    return {
+      reviews: (json.reviews || []).map((r) =>
+        mapReview(r, country, profileUuid),
+      ),
+      pagesCount: json.pagesCount || 1,
+      totalReviews: json.totalReviews ?? null,
+    };
   }
 
-  const title = card.find(sel.title).first().text().trim() || "Untitled";
+  return { browser, fetchPage };
+}
 
-  const scoreRaw = card.find(sel.score).first().text().trim();
-  const score = scoreRaw.replace(",", ".") || "N/A";
-
-  const timeEl = card.find(sel.date).first();
-  const date =
-    timeEl.attr("datetime") || timeEl.text().trim() || "Unknown date";
-
-  const hrefRaw = card.find(sel.link).first().attr("href") || "";
-  const url = hrefRaw.startsWith("http")
-    ? hrefRaw
-    : hrefRaw
-      ? `${CONFIG.baseUrl}${hrefRaw}`
-      : CONFIG.url;
-
-  const id = buildId(hrefRaw || null, title, date);
-
-  return { id, title, score, date, url };
+// Walk every page of reviews (used once, for seeding)
+async function fetchAllReviews(fetchPage) {
+  const first = await fetchPage(1);
+  let all = [...first.reviews];
+  for (let n = 2; n <= first.pagesCount; n++) {
+    const { reviews } = await fetchPage(n);
+    if (!reviews.length) break;
+    all = all.concat(reviews);
+  }
+  return all;
 }
 
 // ── Discord ───────────────────────────────────────────────────────────────────
 
-// Send a Discord embed for a new rating
-async function sendDiscordNotification(rating) {
+// kind: "new" | "update"
+async function sendDiscordNotification(review, kind) {
+  const isUpdate = kind === "update";
+  const label = isUpdate ? "Updated" : "New";
+  const pingVerb = isUpdate
+    ? "A Kununu review was updated"
+    : "New review on Kununu";
+  const stamp = isUpdate ? review.updatedAt : review.createdAt;
+
   try {
-    await axios.post(CONFIG.webhook, {
-      content: CONFIG.userId
-        ? `<@${CONFIG.userId}> New review on Kununu!`
+    await axios.post(process.env.DISCORD_WEBHOOK, {
+      content: process.env.DISCORD_USER_ID
+        ? `<@${process.env.DISCORD_USER_ID}> ${pingVerb}!`
         : undefined,
       embeds: [
         {
-          title: `New Kununu Rating for ${CONFIG.name}`,
-          url: CONFIG.url,
-          color: CONFIG.color,
+          title: `${label} Kununu Rating for ${process.env.KUNUNU_NAME || "Unknown Company"}`,
+          url: review.url,
+          color: isUpdate
+            ? Number.parseInt(process.env.EMBED_COLOR_UPDATE || "0xf9a826")
+            : Number.parseInt(process.env.EMBED_COLOR_NEW || "0x00b4d8"),
           fields: [
             {
               name: "⭐ Rating",
-              value: `**${rating.score}** / 5`,
+              value: `**${review.score}** / 5`,
               inline: true,
             },
             {
               name: "🗓 Date",
-              value: dayjs(rating.date).format("DD.MM.YYYY"),
+              value: dayjs(stamp).isValid()
+                ? dayjs(stamp).format("DD.MM.YYYY")
+                : String(stamp),
               inline: true,
             },
-            { name: "📌 Title", value: rating.title, inline: false },
+            { name: "📌 Title", value: review.title, inline: false },
           ],
-          footer: { text: CONFIG.name },
+          footer: {
+            text: `${process.env.KUNUNU_NAME || "Unknown Company"} • ${isUpdate ? "edited" : "new post"}`,
+          },
           timestamp: new Date().toISOString(),
         },
       ],
@@ -158,41 +216,85 @@ async function sendDiscordNotification(rating) {
   }
 }
 
+// ── One check cycle ─────────────────────────────────────────────────────────────
+
+async function runCycle() {
+  const { browser, fetchPage } = await openSession();
+
+  try {
+    const db = await loadDB();
+
+    // First run: record every review across all pages silently, so we don't
+    // spam every existing review. From then on we only watch page 1, where the
+    // newest and most-recently-edited reviews always surface.
+    if (!db.seeded) {
+      console.log(
+        `🌱 Seeding existing review(s) across all pages — please wait...`,
+      );
+      const all = await fetchAllReviews(fetchPage);
+      for (const r of all) db.reviews[r.id] = snapshot(r);
+      db.seeded = true;
+      await saveDB(db);
+      console.log(
+        `🌱 Seeded ${all.length} existing review(s) across all pages — watching page 1 from now on`,
+      );
+      return;
+    }
+
+    const { reviews } = await fetchPage(1);
+    if (!reviews.length) {
+      console.log("⚠️  Page 1 returned no reviews — skipping this cycle");
+      return;
+    }
+
+    let changes = 0;
+    // Oldest first so notifications arrive in chronological order.
+    for (const r of [...reviews].reverse()) {
+      const known = db.reviews[r.id];
+
+      if (!known) {
+        console.log(`✨ New review: "${r.title}"`);
+        await sendDiscordNotification(r, "new");
+        changes++;
+      } else if (known.updatedAt !== r.updatedAt) {
+        console.log(`📝 Updated review: "${r.title}"`);
+        await sendDiscordNotification(r, "update");
+        changes++;
+      }
+
+      db.reviews[r.id] = snapshot(r);
+    }
+
+    if (changes === 0) console.log("✅ No new or updated reviews");
+    await saveDB(db);
+  } finally {
+    await browser.close();
+  }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 (async () => {
-  console.log(`⭐ Kununu Watcher — ${CONFIG.name}`);
-  console.log("Starting infinite loop...\n");
+  const interval = Number.parseInt(process.env.CHECK_INTERVAL_MS || "300000");
+  const retry = Number.parseInt(process.env.RETRY_MS || "60000");
 
-  await initDB();
+  console.log(
+    `⭐ Kununu Watcher — ${process.env.KUNUNU_NAME || "Unknown Company"}`,
+  );
+  console.log(
+    `Polling ${process.env.KUNUNU_URL} every ${interval / 60000} min\n`,
+  );
 
   while (true) {
     try {
       console.log(`[${new Date().toLocaleTimeString()}] Checking...`);
-
-      const rating = await scrapeLatestRating();
-
-      if (!rating) {
-        console.log("⚠️  Could not extract a rating — skipping this cycle");
-      } else {
-        const db = await loadDB();
-
-        if (rating.id === db.lastRatingId) {
-          console.log(`✅ No new rating (last: ${rating.id})`);
-        } else {
-          console.log(`✨ New rating found: "${rating.title}"`);
-          await sendDiscordNotification(rating);
-          await saveDB({ lastRatingId: rating.id });
-        }
-      }
-
-      console.log(`Waiting ${CONFIG.interval / 60000} minutes...\n`);
-      await new Promise((resolve) => setTimeout(resolve, CONFIG.interval));
+      await runCycle();
+      console.log(`Waiting ${interval / 60000} minutes...\n`);
+      await new Promise((r) => setTimeout(r, interval));
     } catch (error) {
-      console.error("Error during scraping:", error.message);
-      if (error.response) console.error(`HTTP ${error.response.status}`);
-      console.log(`Retrying in ${CONFIG.retry / 1000} seconds...\n`);
-      await new Promise((resolve) => setTimeout(resolve, CONFIG.retry));
+      console.error("Error during check:", error.message);
+      console.log(`Retrying in ${retry / 1000} seconds...\n`);
+      await new Promise((r) => setTimeout(r, retry));
     }
   }
 })();
