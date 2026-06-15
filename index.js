@@ -112,26 +112,40 @@ async function openSession() {
       "--disable-dev-shm-usage",
     ],
   });
-  const context = await browser.newContext({
-    userAgent: HEADERS["User-Agent"],
-    locale: "de-DE",
-    extraHTTPHeaders: { "Accept-Language": HEADERS["Accept-Language"] },
-  });
-  const page = await context.newPage();
+  let context, page, profileUuid;
+  try {
+    context = await browser.newContext({
+      userAgent: HEADERS["User-Agent"],
+      locale: "de-DE",
+      extraHTTPHeaders: { "Accept-Language": HEADERS["Accept-Language"] },
+    });
+    page = await context.newPage();
 
-  await page.goto(process.env.KUNUNU_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: pageTimeout,
-  });
-  // Review cards rendering = WAF challenge cleared + cookies set.
-  await page.waitForSelector(REVIEW_CARD, { timeout: pageTimeout });
+    await page.goto(process.env.KUNUNU_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: pageTimeout,
+    });
+    // Review cards rendering = WAF challenge cleared + cookies set.
+    await page.waitForSelector(REVIEW_CARD, { timeout: pageTimeout });
 
-  const href = await page
-    .$eval(STATEMENTS_LINK, (el) => el.getAttribute("href"))
-    .catch(() => null);
-  const match = href && href.match(/\/statements\/([0-9a-f-]{36})\//i);
-  if (!match) throw new Error("Could not determine profile UUID from the page");
-  const profileUuid = match[1];
+    const href = await page
+      .$eval(STATEMENTS_LINK, (el) => el.getAttribute("href"))
+      .catch(() => null);
+    const match = href && href.match(/\/statements\/([0-9a-f-]{36})\//i);
+    if (!match)
+      throw new Error("Could not determine profile UUID from the page");
+    profileUuid = match[1];
+
+    // WAF cleared, cookies live on `context`, UUID extracted. The tab is done —
+    // every review fetch from here uses context.request, not a page. Close it so
+    // we don't keep a renderer process alive for the session's whole lifetime.
+    await page.close();
+    page = null;
+  } catch (error) {
+    // Setup failed after launch — close the browser so it doesn't leak.
+    await browser.close().catch(() => {});
+    throw error;
+  }
 
   async function fetchPage(n) {
     const res = await context.request.get(
@@ -157,11 +171,11 @@ async function openSession() {
 // Walk every page of reviews (used once, for seeding)
 async function fetchAllReviews(fetchPage) {
   const first = await fetchPage(1);
-  let all = [...first.reviews];
+  const all = [...first.reviews];
   for (let n = 2; n <= first.pagesCount; n++) {
     const { reviews } = await fetchPage(n);
     if (!reviews.length) break;
-    all = all.concat(reviews);
+    all.push(...reviews);
   }
   return all;
 }
@@ -218,58 +232,52 @@ async function sendDiscordNotification(review, kind) {
 
 // ── One check cycle ─────────────────────────────────────────────────────────────
 
-async function runCycle() {
-  const { browser, fetchPage } = await openSession();
+async function runCycle(fetchPage) {
+  const db = await loadDB();
 
-  try {
-    const db = await loadDB();
-
-    // First run: record every review across all pages silently, so we don't
-    // spam every existing review. From then on we only watch page 1, where the
-    // newest and most-recently-edited reviews always surface.
-    if (!db.seeded) {
-      console.log(
-        `🌱 Seeding existing review(s) across all pages — please wait...`,
-      );
-      const all = await fetchAllReviews(fetchPage);
-      for (const r of all) db.reviews[r.id] = snapshot(r);
-      db.seeded = true;
-      await saveDB(db);
-      console.log(
-        `🌱 Seeded ${all.length} existing review(s) across all pages — watching page 1 from now on`,
-      );
-      return;
-    }
-
-    const { reviews } = await fetchPage(1);
-    if (!reviews.length) {
-      console.log("⚠️  Page 1 returned no reviews — skipping this cycle");
-      return;
-    }
-
-    let changes = 0;
-    // Oldest first so notifications arrive in chronological order.
-    for (const r of [...reviews].reverse()) {
-      const known = db.reviews[r.id];
-
-      if (!known) {
-        console.log(`✨ New review: "${r.title}"`);
-        await sendDiscordNotification(r, "new");
-        changes++;
-      } else if (known.updatedAt !== r.updatedAt) {
-        console.log(`📝 Updated review: "${r.title}"`);
-        await sendDiscordNotification(r, "update");
-        changes++;
-      }
-
-      db.reviews[r.id] = snapshot(r);
-    }
-
-    if (changes === 0) console.log("✅ No new or updated reviews");
+  // First run: record every review across all pages silently, so we don't
+  // spam every existing review. From then on we only watch page 1, where the
+  // newest and most-recently-edited reviews always surface.
+  if (!db.seeded) {
+    console.log(
+      `🌱 Seeding existing review(s) across all pages — please wait...`,
+    );
+    const all = await fetchAllReviews(fetchPage);
+    for (const r of all) db.reviews[r.id] = snapshot(r);
+    db.seeded = true;
     await saveDB(db);
-  } finally {
-    await browser.close();
+    console.log(
+      `🌱 Seeded ${all.length} existing review(s) across all pages — watching page 1 from now on`,
+    );
+    return;
   }
+
+  const { reviews } = await fetchPage(1);
+  if (!reviews.length) {
+    console.log("⚠️  Page 1 returned no reviews — skipping this cycle");
+    return;
+  }
+
+  let changes = 0;
+  // Oldest first so notifications arrive in chronological order.
+  for (const r of [...reviews].reverse()) {
+    const known = db.reviews[r.id];
+
+    if (!known) {
+      console.log(`✨ New review: "${r.title}"`);
+      await sendDiscordNotification(r, "new");
+      changes++;
+    } else if (known.updatedAt !== r.updatedAt) {
+      console.log(`📝 Updated review: "${r.title}"`);
+      await sendDiscordNotification(r, "update");
+      changes++;
+    }
+
+    db.reviews[r.id] = snapshot(r);
+  }
+
+  if (changes === 0) console.log("✅ No new or updated reviews");
+  await saveDB(db);
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -285,14 +293,35 @@ async function runCycle() {
     `Polling ${process.env.KUNUNU_URL} every ${interval / 60000} min\n`,
   );
 
+  // Reused across cycles. A failed cycle tears it down so the next one
+  // relaunches with a fresh WAF challenge; a healthy session keeps its cookies.
+  let session = null;
+  const closeSession = async () => {
+    if (session) {
+      await session.browser.close().catch(() => {});
+      session = null;
+    }
+  };
+
+  // Close the browser on shutdown so we don't orphan a chromium process.
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, async () => {
+      await closeSession();
+      process.exit(0);
+    });
+  }
+
   while (true) {
     try {
       console.log(`[${new Date().toLocaleTimeString()}] Checking...`);
-      await runCycle();
+      if (!session) session = await openSession();
+      await runCycle(session.fetchPage);
       console.log(`Waiting ${interval / 60000} minutes...\n`);
       await new Promise((r) => setTimeout(r, interval));
     } catch (error) {
       console.error("Error during check:", error.message);
+      // Drop the session so the next attempt starts clean.
+      await closeSession();
       console.log(`Retrying in ${retry / 1000} seconds...\n`);
       await new Promise((r) => setTimeout(r, retry));
     }
